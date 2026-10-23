@@ -645,8 +645,8 @@ impl Stellar_CardReceiver {
     /// payments, the smaller the blast radius. Resuming is stricter; see
     /// `unpause`.
     ///
-    /// # Events (Issue #428 - Part 5)
-    /// Emits: topics=[Symbol("paused"), caller], value=true
+    /// # Events (Issue #642)
+    /// Emits: topics=[Symbol("contract_paused"), caller], value=true
     ///
     /// # Notes
     /// Idempotent — calling when already paused is a no-op.
@@ -666,9 +666,10 @@ impl Stellar_CardReceiver {
         env.storage().instance().set(&DataKey::Paused, &true);
         Self::extend_instance_ttl(&env);
 
-        // Emit pause event (Issue #428 - Part 5)
-        env.events()
-            .publish((symbol_short!("paused"), caller), true);
+        env.events().publish(
+            (Symbol::new(&env, "contract_paused"), caller),
+            true,
+        );
     }
 
     /// Unpauses the contract, re-enabling token transfers.
@@ -681,8 +682,8 @@ impl Stellar_CardReceiver {
     /// than pausing because it reopens the payment flow after an incident,
     /// so it requires admin approval.
     ///
-    /// # Events (Issue #428 - Part 5)
-    /// Emits: topics=[Symbol("unpaused"), admin], value=false
+    /// # Events (Issue #642)
+    /// Emits: topics=[Symbol("contract_unpaused"), admin], value=false
     ///
     /// # Notes
     /// Idempotent — calling when already unpaused is a no-op.
@@ -701,9 +702,10 @@ impl Stellar_CardReceiver {
         env.storage().instance().remove(&DataKey::Paused);
         Self::extend_instance_ttl(&env);
 
-        // Emit unpause event (Issue #428 - Part 5)
-        env.events()
-            .publish((symbol_short!("unpaused"), admin), false);
+        env.events().publish(
+            (Symbol::new(&env, "contract_unpaused"), admin),
+            false,
+        );
     }
 
     /// Extends instance storage's TTL, but only performs the (fee-costing)
@@ -5209,14 +5211,26 @@ mod test {
         let operator = Address::generate(&f.env);
         f.client().grant_role(&operator, &Role::Operator);
         f.client().pause(&operator);
-        assert_eq!(contract_event_count(&f.env, &f.contract_id, "paused"), 1);
+        assert_eq!(
+            contract_event_count(&f.env, &f.contract_id, "contract_paused"),
+            1
+        );
         f.client().pause(&operator);
-        assert_eq!(contract_event_count(&f.env, &f.contract_id, "paused"), 0);
+        assert_eq!(
+            contract_event_count(&f.env, &f.contract_id, "contract_paused"),
+            0
+        );
 
         f.client().unpause();
-        assert_eq!(contract_event_count(&f.env, &f.contract_id, "unpaused"), 1);
+        assert_eq!(
+            contract_event_count(&f.env, &f.contract_id, "contract_unpaused"),
+            1
+        );
         f.client().unpause();
-        assert_eq!(contract_event_count(&f.env, &f.contract_id, "unpaused"), 0);
+        assert_eq!(
+            contract_event_count(&f.env, &f.contract_id, "contract_unpaused"),
+            0
+        );
     }
 
     // ── state-change event coverage (issue #398) ──────────────────────────────
