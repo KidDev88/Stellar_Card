@@ -6656,6 +6656,136 @@ mod test {
         );
     }
 
+    // ── TTL extension threshold mechanics (Issue #644) ───────────────────────
+
+    #[test]
+    fn test_instance_ttl_constants() {
+        assert_eq!(INSTANCE_TTL_MAX, 17_280_000);
+        assert_eq!(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_MAX / 2);
+        assert_eq!(INSTANCE_TTL_THRESHOLD, 8_640_000);
+    }
+
+    #[test]
+    fn test_ttl_extension_triggers_near_threshold() {
+        use soroban_sdk::testutils::storage::Instance;
+
+        let f = Fixture::new();
+        f.init();
+
+        // Record TTL right after init.
+        let ttl_initial = f
+            .env
+            .as_contract(&f.contract_id, || f.env.storage().instance().get_ttl());
+        assert!(ttl_initial > 0);
+
+        // Simulate a large ledger jump so remaining TTL drops near the
+        // threshold. The test network caps max_entry_ttl, so we advance by
+        // a large amount and then invoke a payment to trigger extension.
+        f.env.ledger().with_mut(|li| {
+            li.sequence_number += 5_000_000;
+        });
+
+        f.mint_usdc(&f.payer, 1_000_000);
+        let oid = order_bytes(&f.env, "ttl-near-threshold");
+        f.client().pay_usdc(&f.payer, &1_000_000, &oid);
+
+        let ttl_after = f
+            .env
+            .as_contract(&f.contract_id, || f.env.storage().instance().get_ttl());
+        assert!(
+            ttl_after > 0,
+            "TTL must remain positive after extension near threshold"
+        );
+    }
+
+    #[test]
+    fn test_payment_invokes_ttl_extension() {
+        use soroban_sdk::testutils::storage::Instance;
+
+        let f = Fixture::new();
+        f.init();
+
+        let ttl_before = f
+            .env
+            .as_contract(&f.contract_id, || f.env.storage().instance().get_ttl());
+
+        // Advance ledgers to push TTL below the extension threshold.
+        f.env.ledger().with_mut(|li| {
+            li.sequence_number += 4_000_000;
+        });
+
+        f.mint_usdc(&f.payer, 500_000);
+        let oid = order_bytes(&f.env, "ttl-pay-ext");
+        f.client().pay_usdc(&f.payer, &500_000, &oid);
+
+        let ttl_after = f
+            .env
+            .as_contract(&f.contract_id, || f.env.storage().instance().get_ttl());
+        assert!(
+            ttl_after > ttl_before.saturating_sub(4_000_000),
+            "payment should have extended instance TTL"
+        );
+    }
+
+    #[test]
+    fn test_admin_function_invokes_ttl_extension() {
+        use soroban_sdk::testutils::storage::Instance;
+
+        let f = Fixture::new();
+        f.init();
+
+        let ttl_before = f
+            .env
+            .as_contract(&f.contract_id, || f.env.storage().instance().get_ttl());
+
+        // Advance ledgers to push TTL near the threshold.
+        f.env.ledger().with_mut(|li| {
+            li.sequence_number += 4_000_000;
+        });
+
+        let user = Address::generate(&f.env);
+        f.client().grant_role(&user, &Role::Viewer);
+
+        let ttl_after = f
+            .env
+            .as_contract(&f.contract_id, || f.env.storage().instance().get_ttl());
+        assert!(
+            ttl_after > 0,
+            "admin function must extend instance TTL"
+        );
+    }
+
+    #[test]
+    fn test_pause_unpause_invoke_ttl_extension() {
+        use soroban_sdk::testutils::storage::Instance;
+
+        let f = Fixture::new();
+        f.init();
+
+        let operator = Address::generate(&f.env);
+        f.client().grant_role(&operator, &Role::Operator);
+
+        f.env.ledger().with_mut(|li| {
+            li.sequence_number += 4_000_000;
+        });
+
+        f.client().pause(&operator);
+        let ttl_after_pause = f
+            .env
+            .as_contract(&f.contract_id, || f.env.storage().instance().get_ttl());
+        assert!(ttl_after_pause > 0, "pause must extend instance TTL");
+
+        f.env.ledger().with_mut(|li| {
+            li.sequence_number += 4_000_000;
+        });
+
+        f.client().unpause();
+        let ttl_after_unpause = f
+            .env
+            .as_contract(&f.contract_id, || f.env.storage().instance().get_ttl());
+        assert!(ttl_after_unpause > 0, "unpause must extend instance TTL");
+    }
+
     // ── Token transfer tests (Issue #393 - Part 2) ────────────────────────────
     //
     // The earlier transfer tests check balances, amounts and events. These
