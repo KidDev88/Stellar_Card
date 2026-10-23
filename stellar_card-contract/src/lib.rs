@@ -83,6 +83,10 @@ pub enum DataKey {
     ReentrancyGuard,
     /// Circuit breaker: when true, `pay_usdc`/`pay_xlm` refuse new payments.
     Paused,
+    /// Optional address that receives protocol fees (distinct from treasury).
+    FeeCollector,
+    /// Protocol fee in basis points (e.g. 20 = 0.2%) deducted from payments.
+    FeeBps,
 }
 
 /// Contract errors
@@ -180,6 +184,67 @@ impl Stellar_CardReceiver {
         env.storage().temporary().set(&DataKey::ReentrancyGuard, &false);
     }
 
+    /// Routes a payment from `from` to the treasury, optionally splitting a
+    /// protocol fee off to a configured `FeeCollector`.
+    ///
+    /// When no fee collector is set, or `FeeBps` is 0, the full `amount` is
+    /// forwarded to the treasury — preserving pre-fee behaviour exactly.
+    ///
+    /// # Errors
+    /// * `TransferFailed` - If either leg of the transfer fails
+    fn _transfer_with_fee(
+        env: &Env,
+        from: &Address,
+        amount: i128,
+        token_contract: &Address,
+    ) -> Result<(), Error> {
+        let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
+        let fee_collector: Option<Address> = env.storage().instance().get(&DataKey::FeeCollector);
+        let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
+
+        let token_client = token::Client::new(env, token_contract);
+
+        // Split the fee out first so the treasury leg is the remainder.
+        // Computed without a single `amount * bps` multiply so a max-i128
+        // payment with a fee configured cannot overflow (release profile
+        // has `overflow-checks = true`).
+        let mut fee_amount: i128 = 0;
+        if let Some(collector) = fee_collector.clone() {
+            if fee_bps > 0 {
+                let bps = fee_bps as i128;
+                fee_amount = (amount / 10_000) * bps + ((amount % 10_000) * bps) / 10_000;
+                if fee_amount > 0 {
+                    let res = token_client.try_transfer(from, &collector, &fee_amount);
+                    if res.is_err() {
+                        return Err(Error::TransferFailed);
+                    }
+                }
+            }
+        }
+
+        let treasury_amount = amount - fee_amount;
+        if treasury_amount > 0 {
+            let res = token_client.try_transfer(from, &treasury, &treasury_amount);
+            if res.is_err() {
+                return Err(Error::TransferFailed);
+            }
+        }
+
+        if fee_amount > 0 {
+            if let Some(collector) = fee_collector {
+                env.events().publish(
+                    (
+                        Symbol::new(env, "fee_collected"),
+                        token_contract.clone(),
+                        from.clone(),
+                    ),
+                    fee_amount,
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Returns whether the contract is currently paused.
     fn is_paused(env: &Env) -> bool {
         env.storage().instance().get::<_, bool>(&DataKey::Paused).unwrap_or(false)
@@ -267,19 +332,14 @@ impl Stellar_CardReceiver {
         }
         from.require_auth();
 
-        let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
         let usdc_contract: Address = env.storage().instance().get(&DataKey::UsdcContract).unwrap();
 
         Self::_enter(&env);
-
-        let token_client = token::Client::new(&env, &usdc_contract);
-        let res = token_client.try_transfer(&from, &treasury, &amount);
+        let res = Self::_transfer_with_fee(&env, &from, amount, &usdc_contract);
+        Self::_exit(&env);
         if res.is_err() {
-            Self::_exit(&env);
             return Err(Error::TransferFailed);
         }
-
-        Self::_exit(&env);
 
         env.events().publish(
             (Symbol::new(&env, "pay_usdc"), order_id, from),
@@ -317,19 +377,14 @@ impl Stellar_CardReceiver {
         }
         from.require_auth();
 
-        let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
         let xlm_contract: Address = env.storage().instance().get(&DataKey::XlmContract).unwrap();
 
         Self::_enter(&env);
-
-        let token_client = token::Client::new(&env, &xlm_contract);
-        let res = token_client.try_transfer(&from, &treasury, &amount);
+        let res = Self::_transfer_with_fee(&env, &from, amount, &xlm_contract);
+        Self::_exit(&env);
         if res.is_err() {
-            Self::_exit(&env);
             return Err(Error::TransferFailed);
         }
-
-        Self::_exit(&env);
 
         env.events().publish(
             (Symbol::new(&env, "pay_xlm"), order_id, from),
@@ -367,19 +422,14 @@ impl Stellar_CardReceiver {
         }
         from.require_auth();
 
-        let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
         let eurc_contract: Address = env.storage().instance().get(&DataKey::EurcContract).unwrap();
 
         Self::_enter(&env);
-
-        let token_client = token::Client::new(&env, &eurc_contract);
-        let res = token_client.try_transfer(&from, &treasury, &amount);
+        let res = Self::_transfer_with_fee(&env, &from, amount, &eurc_contract);
+        Self::_exit(&env);
         if res.is_err() {
-            Self::_exit(&env);
             return Err(Error::TransferFailed);
         }
-
-        Self::_exit(&env);
 
         env.events().publish(
             (Symbol::new(&env, "pay_eurc"), order_id, from),
@@ -600,6 +650,55 @@ impl Stellar_CardReceiver {
 
         env.storage().instance().set(&DataKey::EurcContract, &eurc_contract);
         Self::extend_instance_ttl(&env);
+    }
+
+    /// Sets the address that receives protocol fees, distinct from the
+    /// order-fulfillment treasury.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `fee_collector` - The address that will receive protocol fees
+    ///
+    /// # Authorization
+    /// Only the admin can call this function.
+    pub fn set_fee_collector(env: Env, fee_collector: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        env.storage().instance().set(&DataKey::FeeCollector, &fee_collector);
+        Self::extend_instance_ttl(&env);
+    }
+
+    /// Sets the protocol fee rate in basis points (1 bps = 0.01%).
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `fee_bps` - Fee rate in basis points, e.g. 20 = 0.2%. Must be <= 10_000.
+    ///
+    /// # Authorization
+    /// Only the admin can call this function.
+    ///
+    /// # Panics
+    /// Panics if `fee_bps` exceeds 10_000 (100%).
+    pub fn set_fee_bps(env: Env, fee_bps: u32) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        if fee_bps > 10_000 {
+            panic!("fee_bps cannot exceed 10000");
+        }
+        env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
+        Self::extend_instance_ttl(&env);
+    }
+
+    /// Returns the fee collector address, if configured.
+    pub fn fee_collector(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::FeeCollector)
+    }
+
+    /// Returns the protocol fee rate in basis points (0 when unset).
+    pub fn fee_bps(env: Env) -> u32 {
+        env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0)
     }
 
     /// Grants a role to an address.
@@ -1125,6 +1224,133 @@ mod test {
 
         let oid = order_bytes(&f.env, "eurc-paused");
         assert!(f.client().try_pay_eurc(&f.payer, &amount, &oid).is_err());
+    }
+
+    // ── fee collector tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_set_fee_collector_and_bps() {
+        let f = Fixture::new();
+        f.init();
+
+        let collector = Address::generate(&f.env);
+        f.client().set_fee_collector(&collector);
+        f.client().set_fee_bps(&20u32);
+
+        assert_eq!(f.client().fee_collector(), Some(collector));
+        assert_eq!(f.client().fee_bps(), 20);
+    }
+
+    #[test]
+    fn test_fee_defaults_to_zero_bps_and_no_collector() {
+        let f = Fixture::new();
+        f.init();
+
+        assert_eq!(f.client().fee_collector(), None);
+        assert_eq!(f.client().fee_bps(), 0);
+    }
+
+    #[test]
+    fn test_pay_usdc_splits_fee_to_collector_and_treasury() {
+        let f = Fixture::new();
+        f.init();
+
+        let collector = Address::generate(&f.env);
+        f.client().set_fee_collector(&collector);
+        f.client().set_fee_bps(&20u32); // 0.2%
+
+        let amount: i128 = 100_000_000; // 100.00 USDC
+        f.mint_usdc(&f.payer, amount);
+
+        let oid = order_bytes(&f.env, "fee-split");
+        f.client().pay_usdc(&f.payer, &amount, &oid);
+
+        let expected_fee = amount * 20 / 10_000;
+        let expected_treasury = amount - expected_fee;
+
+        assert_eq!(f.usdc_balance(&collector), expected_fee);
+        assert_eq!(f.usdc_balance(&f.treasury), expected_treasury);
+        assert_eq!(f.usdc_balance(&f.payer), 0);
+    }
+
+    #[test]
+    fn test_pay_usdc_without_fee_sends_full_amount_to_treasury() {
+        let f = Fixture::new();
+        f.init();
+
+        let amount: i128 = 50_000_000;
+        f.mint_usdc(&f.payer, amount);
+
+        let oid = order_bytes(&f.env, "no-fee");
+        f.client().pay_usdc(&f.payer, &amount, &oid);
+
+        assert_eq!(f.usdc_balance(&f.treasury), amount);
+    }
+
+    #[test]
+    fn test_fee_collected_event_emitted() {
+        let f = Fixture::new();
+        f.init();
+
+        let collector = Address::generate(&f.env);
+        f.client().set_fee_collector(&collector);
+        f.client().set_fee_bps(&20u32);
+
+        let amount: i128 = 100_000_000;
+        f.mint_usdc(&f.payer, amount);
+
+        let oid = order_bytes(&f.env, "fee-event");
+        f.client().pay_usdc(&f.payer, &amount, &oid);
+
+        let expected_fee = amount * 20 / 10_000;
+        let events = f.env.events().all();
+        let mut found = false;
+        for (contract_addr, topics, data) in events.iter() {
+            if contract_addr != f.contract_id {
+                continue;
+            }
+            let sym: Symbol = topics.get(0).unwrap().try_into_val(&f.env).unwrap();
+            if sym != Symbol::new(&f.env, "fee_collected") {
+                continue;
+            }
+            let asset: Address = topics.get(1).unwrap().try_into_val(&f.env).unwrap();
+            assert_eq!(asset, f.usdc);
+            let payer: Address = topics.get(2).unwrap().try_into_val(&f.env).unwrap();
+            assert_eq!(payer, f.payer);
+            let fee: i128 = data.try_into_val(&f.env).unwrap();
+            assert_eq!(fee, expected_fee);
+            found = true;
+            break;
+        }
+        assert!(found, "fee_collected event not found");
+    }
+
+    #[test]
+    fn test_xlm_fee_split_routes_to_collector() {
+        let f = Fixture::new();
+        f.init();
+
+        let collector = Address::generate(&f.env);
+        f.client().set_fee_collector(&collector);
+        f.client().set_fee_bps(&20u32);
+
+        let amount: i128 = 10_000_000;
+        f.mint_xlm(&f.payer, amount);
+
+        let oid = order_bytes(&f.env, "xlm-fee");
+        f.client().pay_xlm(&f.payer, &amount, &oid);
+
+        let expected_fee = amount * 20 / 10_000;
+        assert_eq!(f.xlm_balance(&collector), expected_fee);
+        assert_eq!(f.xlm_balance(&f.treasury), amount - expected_fee);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_set_fee_bps_above_10000_panics() {
+        let f = Fixture::new();
+        f.init();
+        f.client().set_fee_bps(&10_001u32);
     }
 
     // ── upgrade tests ─────────────────────────────────────────────────────────
