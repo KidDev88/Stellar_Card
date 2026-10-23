@@ -243,6 +243,10 @@ pub enum DataKey {
     /// Maximum 10000 bps (100% discount). Persistent storage, per-address key
     /// following the `UserRole` pattern.
     Discounts(Address),
+    /// `(min_amount, max_amount)` payment bounds for USDC. Absent means unbound.
+    PaymentLimitUsdc,
+    /// `(min_amount, max_amount)` payment bounds for XLM. Absent means unbound.
+    PaymentLimitXlm,
 }
 
 /// Errors returned by the fallible (`Result`-returning) entrypoints.
@@ -285,6 +289,8 @@ pub enum Error {
     RateLimitExceeded = 10,
     /// Payment rate parameters are zero or exceed supported bounds
     InvalidRateLimit = 11,
+    /// Payment amount is outside the configured min/max bounds for the asset
+    AmountOutOfBounds = 12,
 }
 
 /// The stellar_card card receiver contract.
@@ -817,6 +823,80 @@ impl Stellar_CardReceiver {
         );
     }
 
+    /// Configures min/max payment amount bounds for an asset.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `caller` - The admin address (must authorize this call)
+    /// * `asset` - `"USDC"` or `"XLM"`
+    /// * `min` - Minimum payment amount (0 = unbound)
+    /// * `max` - Maximum payment amount (0 = unbound)
+    ///
+    /// # Authorization
+    /// Requires the `Admin` role.
+    ///
+    /// # Errors
+    /// * `AmountOutOfBounds` - If `min` > `max` when both are nonzero, or
+    ///   if either value is negative.
+    pub fn set_payment_limits(
+        env: Env,
+        caller: Address,
+        asset: Symbol,
+        min: i128,
+        max: i128,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_not_decommissioned(&env);
+        if !Self::has_admin_authority(&env, &caller) {
+            panic!("set_payment_limits requires the Admin role");
+        }
+        if min < 0 || max < 0 {
+            return Err(Error::AmountOutOfBounds);
+        }
+        if min > 0 && max > 0 && min > max {
+            return Err(Error::AmountOutOfBounds);
+        }
+
+        let key = if asset == Symbol::new(&env, "USDC") {
+            DataKey::PaymentLimitUsdc
+        } else if asset == Symbol::new(&env, "XLM") {
+            DataKey::PaymentLimitXlm
+        } else {
+            panic!("asset must be \"USDC\" or \"XLM\"");
+        };
+
+        env.storage().instance().set(&key, &(min, max));
+        Self::extend_instance_ttl(&env);
+        env.events().publish(
+            (Symbol::new(&env, "payment_limits_set"), caller),
+            (asset, min, max),
+        );
+        Ok(())
+    }
+
+    /// Returns the `(min, max)` payment bounds for the given asset key.
+    /// Absent key means unbound (0, 0).
+    fn payment_limits(env: &Env, key: &DataKey) -> (i128, i128) {
+        env.storage().instance().get(key).unwrap_or((0, 0))
+    }
+
+    /// Checks that `amount` falls within the configured bounds for the asset.
+    /// Zero bound means unbound on that side.
+    fn check_payment_limits(
+        env: &Env,
+        key: &DataKey,
+        amount: i128,
+    ) -> Result<(), Error> {
+        let (min, max) = Self::payment_limits(env, key);
+        if min > 0 && amount < min {
+            return Err(Error::AmountOutOfBounds);
+        }
+        if max > 0 && amount > max {
+            return Err(Error::AmountOutOfBounds);
+        }
+        Ok(())
+    }
+
     /// Transfers USDC tokens from a payer to the contract treasury.
     ///
     /// # Arguments
@@ -862,6 +942,7 @@ impl Stellar_CardReceiver {
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
+        Self::check_payment_limits(&env, &DataKey::PaymentLimitUsdc, amount)?;
         if Self::is_blacklisted(&env, &from) {
             return Err(Error::AddressBlacklisted);
         }
@@ -925,6 +1006,7 @@ impl Stellar_CardReceiver {
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
+        Self::check_payment_limits(&env, &DataKey::PaymentLimitUsdc, amount)?;
         if Self::is_blacklisted(&env, &from) {
             return Err(Error::AddressBlacklisted);
         }
@@ -992,6 +1074,7 @@ impl Stellar_CardReceiver {
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
+        Self::check_payment_limits(&env, &DataKey::PaymentLimitXlm, amount)?;
         if Self::is_blacklisted(&env, &from) {
             return Err(Error::AddressBlacklisted);
         }
@@ -1051,6 +1134,7 @@ impl Stellar_CardReceiver {
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
+        Self::check_payment_limits(&env, &DataKey::PaymentLimitXlm, amount)?;
         if Self::is_blacklisted(&env, &from) {
             return Err(Error::AddressBlacklisted);
         }
@@ -7456,6 +7540,7 @@ mod test {
     assert_eq!(Error::ArithmeticOverflow as u32, 9);
     assert_eq!(Error::RateLimitExceeded as u32, 10);
     assert_eq!(Error::InvalidRateLimit as u32, 11);
+    assert_eq!(Error::AmountOutOfBounds as u32, 12);
     }
 
     /// The crate docs state `TOKEN_DECIMALS` is 7 and that the TTL threshold
@@ -8070,5 +8155,139 @@ mod test {
 
         // 999 - (999 * 500 / 10000) = 999 - 49 = 950
         assert_eq!(f.usdc_balance(&f.treasury), 950);
+    }
+
+    // ── Payment amount limits (Issue #641) ───────────────────────────────────
+
+    #[test]
+    fn test_set_payment_limits_requires_admin() {
+        let f = Fixture::new();
+        f.init();
+
+        let non_admin = Address::generate(&f.env);
+        let result = f
+            .client()
+            .try_set_payment_limits(&non_admin, &Symbol::new(&f.env, "USDC"), &100, &1000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_payment_limits_rejects_negative_values() {
+        let f = Fixture::new();
+        f.init();
+
+        let result = f
+            .client()
+            .try_set_payment_limits(&f.admin, &Symbol::new(&f.env, "USDC"), &-1, &1000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_payment_limits_rejects_min_greater_than_max() {
+        let f = Fixture::new();
+        f.init();
+
+        let result = f
+            .client()
+            .try_set_payment_limits(&f.admin, &Symbol::new(&f.env, "USDC"), &500, &100);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_payment_below_min_is_rejected() {
+        let f = Fixture::new();
+        f.init();
+
+        f.client()
+            .set_payment_limits(&f.admin, &Symbol::new(&f.env, "USDC"), &1000, &0);
+        f.mint_usdc(&f.payer, 5_000);
+
+        let result = f
+            .client()
+            .try_pay_usdc(&f.payer, &500, &order_bytes(&f.env, "below-min"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_payment_above_max_is_rejected() {
+        let f = Fixture::new();
+        f.init();
+
+        f.client()
+            .set_payment_limits(&f.admin, &Symbol::new(&f.env, "USDC"), &0, &1000);
+        f.mint_usdc(&f.payer, 5_000);
+
+        let result = f
+            .client()
+            .try_pay_usdc(&f.payer, &2000, &order_bytes(&f.env, "above-max"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_payment_within_limits_succeeds() {
+        let f = Fixture::new();
+        f.init();
+
+        f.client()
+            .set_payment_limits(&f.admin, &Symbol::new(&f.env, "USDC"), &100, &1000);
+        f.mint_usdc(&f.payer, 5_000);
+
+        let result = f
+            .client()
+            .try_pay_usdc(&f.payer, &500, &order_bytes(&f.env, "within-limits"));
+        assert!(result.is_ok());
+        assert_eq!(f.usdc_balance(&f.treasury), 500);
+    }
+
+    #[test]
+    fn test_zero_limits_mean_unbound() {
+        let f = Fixture::new();
+        f.init();
+
+        f.client()
+            .set_payment_limits(&f.admin, &Symbol::new(&f.env, "USDC"), &0, &0);
+        f.mint_usdc(&f.payer, 1_000_000);
+
+        let result = f
+            .client()
+            .try_pay_usdc(&f.payer, &999_999, &order_bytes(&f.env, "unbound"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_xlm_payment_limits_enforced() {
+        let f = Fixture::new();
+        f.init();
+
+        f.client()
+            .set_payment_limits(&f.admin, &Symbol::new(&f.env, "XLM"), &100, &1000);
+        f.mint_xlm(&f.payer, 5_000);
+
+        let below = f
+            .client()
+            .try_pay_xlm(&f.payer, &50, &order_bytes(&f.env, "xlm-below"));
+        assert!(below.is_err());
+
+        let above = f
+            .client()
+            .try_pay_xlm(&f.payer, &2000, &order_bytes(&f.env, "xlm-above"));
+        assert!(above.is_err());
+
+        let ok = f
+            .client()
+            .try_pay_xlm(&f.payer, &500, &order_bytes(&f.env, "xlm-ok"));
+        assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn test_unset_limits_allow_any_amount() {
+        let f = Fixture::new();
+        f.init();
+
+        f.mint_usdc(&f.payer, 1_000_000);
+        let result = f
+            .client()
+            .try_pay_usdc(&f.payer, &1, &order_bytes(&f.env, "no-limits"));
+        assert!(result.is_ok());
     }
 }
