@@ -69,6 +69,8 @@ pub enum DataKey {
     UsdcContract,
     /// Address of the native XLM Stellar Asset Contract (SAC).
     XlmContract,
+    /// Address of the EURC Stellar Asset Contract (SAC).
+    EurcContract,
     /// Address of the contract administrator.
     Admin,
     /// Per-address role assignment. Replaces a single `Roles: Map<Address, Role>`
@@ -338,6 +340,56 @@ impl Stellar_CardReceiver {
         Ok(())
     }
 
+    /// Transfers EURC tokens from a payer to the contract treasury.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `from` - The payer address (must authorize this transfer)
+    /// * `amount` - Amount in micro-EURC (7 decimal places)
+    /// * `order_id` - Order identifier for event tracking
+    ///
+    /// # Returns
+    /// `Ok(())` on successful transfer, `Err(Error)` otherwise.
+    ///
+    /// # Errors
+    /// * `InvalidAmount` - If amount is <= 0
+    /// * `TransferFailed` - If the underlying token transfer fails
+    /// * `ContractPaused` - If the contract is currently paused
+    ///
+    /// # Events
+    /// Emits: topics=[Symbol("pay_eurc"), order_id, from], value=amount
+    pub fn pay_eurc(env: Env, from: Address, amount: i128, order_id: Bytes) -> Result<(), Error> {
+        if Self::is_paused(&env) {
+            return Err(Error::ContractPaused);
+        }
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        from.require_auth();
+
+        let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
+        let eurc_contract: Address = env.storage().instance().get(&DataKey::EurcContract).unwrap();
+
+        Self::_enter(&env);
+
+        let token_client = token::Client::new(&env, &eurc_contract);
+        let res = token_client.try_transfer(&from, &treasury, &amount);
+        if res.is_err() {
+            Self::_exit(&env);
+            return Err(Error::TransferFailed);
+        }
+
+        Self::_exit(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "pay_eurc"), order_id, from),
+            amount,
+        );
+
+        Self::extend_instance_ttl(&env);
+        Ok(())
+    }
+
     /// Returns the treasury address where payments are received.
     ///
     /// # Arguments
@@ -380,6 +432,21 @@ impl Stellar_CardReceiver {
     /// Panics if called before `init` (see `try_xlm_contract` to avoid this).
     pub fn xlm_contract(env: Env) -> Address {
         env.storage().instance().get(&DataKey::XlmContract).unwrap()
+    }
+
+    /// Returns the EURC SAC contract address.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    ///
+    /// # Returns
+    /// The EURC contract address
+    ///
+    /// # Panics
+    /// Panics if called before `init` (see `try_eurc_contract` to avoid this),
+    /// or if `set_eurc_contract` has never been called on a legacy deployment.
+    pub fn eurc_contract(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::EurcContract).unwrap()
     }
 
     /// Returns the admin address.
@@ -512,6 +579,27 @@ impl Stellar_CardReceiver {
 
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.storage().instance().extend_ttl(17_280_000, 17_280_000);
+    }
+
+    /// Sets the EURC Stellar Asset Contract address used by `pay_eurc`.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `eurc_contract` - The EURC SAC contract address
+    ///
+    /// # Authorization
+    /// Only the admin can call this function.
+    ///
+    /// # Notes
+    /// Provided as the upgrade/migration path for already-deployed contracts
+    /// that were initialized before EURC support existed — `init`'s signature
+    /// is unchanged so existing deployments remain compatible.
+    pub fn set_eurc_contract(env: Env, eurc_contract: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        env.storage().instance().set(&DataKey::EurcContract, &eurc_contract);
+        Self::extend_instance_ttl(&env);
     }
 
     /// Grants a role to an address.
@@ -659,6 +747,7 @@ mod test {
         payer: Address,
         usdc: Address,
         xlm_sac: Address,
+        eurc: Address,
     }
 
     impl Fixture {
@@ -670,13 +759,14 @@ mod test {
             let treasury = Address::generate(&env);
             let payer = Address::generate(&env);
 
-            // Register mock SAC token contracts for USDC and XLM
+            // Register mock SAC token contracts for USDC, XLM, and EURC
             let usdc = env.register_stellar_asset_contract_v2(admin.clone()).address();
             let xlm_sac = env.register_stellar_asset_contract_v2(admin.clone()).address();
+            let eurc = env.register_stellar_asset_contract_v2(admin.clone()).address();
 
             let contract_id = env.register(Stellar_CardReceiver, ());
 
-            Fixture { env, contract_id, admin, treasury, payer, usdc, xlm_sac }
+            Fixture { env, contract_id, admin, treasury, payer, usdc, xlm_sac, eurc }
         }
 
         fn client(&self) -> Stellar_CardReceiverClient<'_> {
@@ -695,12 +785,20 @@ mod test {
             token::StellarAssetClient::new(&self.env, &self.xlm_sac).mint(to, &amount);
         }
 
+        fn mint_eurc(&self, to: &Address, amount: i128) {
+            token::StellarAssetClient::new(&self.env, &self.eurc).mint(to, &amount);
+        }
+
         fn usdc_balance(&self, addr: &Address) -> i128 {
             token::Client::new(&self.env, &self.usdc).balance(addr)
         }
 
         fn xlm_balance(&self, addr: &Address) -> i128 {
             token::Client::new(&self.env, &self.xlm_sac).balance(addr)
+        }
+
+        fn eurc_balance(&self, addr: &Address) -> i128 {
+            token::Client::new(&self.env, &self.eurc).balance(addr)
         }
     }
 
@@ -921,6 +1019,112 @@ mod test {
         f.init();
         let oid = order_bytes(&f.env, "xlm-neg");
         assert!(f.client().try_pay_xlm(&f.payer, &(-50_000_000_i128), &oid).is_err());
+    }
+
+    // ── pay_eurc tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_set_eurc_contract_stores_address() {
+        let f = Fixture::new();
+        f.init();
+        f.client().set_eurc_contract(&f.eurc);
+        assert_eq!(f.client().eurc_contract(), f.eurc);
+    }
+
+    #[test]
+    fn test_pay_eurc_transfers_to_treasury() {
+        let f = Fixture::new();
+        f.init();
+        f.client().set_eurc_contract(&f.eurc);
+
+        let amount: i128 = 15_000_000; // 15.00 EURC (7 d.p.)
+        f.mint_eurc(&f.payer, amount);
+
+        let oid = order_bytes(&f.env, "b8e1d4a2-6c3f-4a91-9e2b");
+        f.client().pay_eurc(&f.payer, &amount, &oid);
+
+        assert_eq!(f.eurc_balance(&f.treasury), amount);
+        assert_eq!(f.eurc_balance(&f.payer), 0);
+    }
+
+    #[test]
+    fn test_pay_eurc_emits_correct_event() {
+        let f = Fixture::new();
+        f.init();
+        f.client().set_eurc_contract(&f.eurc);
+
+        let amount: i128 = 15_000_000;
+        f.mint_eurc(&f.payer, amount);
+
+        let oid = order_bytes(&f.env, "eurc-event");
+        f.client().pay_eurc(&f.payer, &amount, &oid);
+
+        let events = f.env.events().all();
+        let mut found = false;
+        for (contract_addr, topics, data) in events.iter() {
+            if contract_addr != f.contract_id {
+                continue;
+            }
+            let sym: Symbol = topics.get(0).unwrap().try_into_val(&f.env).unwrap();
+            if sym != Symbol::new(&f.env, "pay_eurc") {
+                continue;
+            }
+            let emitted_oid: Bytes = topics.get(1).unwrap().try_into_val(&f.env).unwrap();
+            assert_eq!(emitted_oid, oid);
+            let emitted_from: Address = topics.get(2).unwrap().try_into_val(&f.env).unwrap();
+            assert_eq!(emitted_from, f.payer);
+            let emitted_amount: i128 = data.try_into_val(&f.env).unwrap();
+            assert_eq!(emitted_amount, amount);
+            found = true;
+            break;
+        }
+        assert!(found, "pay_eurc event not found");
+    }
+
+    #[test]
+    fn test_pay_eurc_requires_auth() {
+        let f = Fixture::new();
+        f.init();
+        f.client().set_eurc_contract(&f.eurc);
+
+        let amount: i128 = 1_000_000;
+        f.mint_eurc(&f.payer, amount);
+
+        let oid = order_bytes(&f.env, "eurc-auth");
+        f.env.mock_auths(&[]);
+        assert!(f.client().try_pay_eurc(&f.payer, &amount, &oid).is_err());
+    }
+
+    #[test]
+    fn test_pay_eurc_rejects_zero_amount() {
+        let f = Fixture::new();
+        f.init();
+        f.client().set_eurc_contract(&f.eurc);
+        let oid = order_bytes(&f.env, "eurc-zero");
+        assert!(f.client().try_pay_eurc(&f.payer, &0_i128, &oid).is_err());
+    }
+
+    #[test]
+    fn test_pay_eurc_rejects_negative_amount() {
+        let f = Fixture::new();
+        f.init();
+        f.client().set_eurc_contract(&f.eurc);
+        let oid = order_bytes(&f.env, "eurc-neg");
+        assert!(f.client().try_pay_eurc(&f.payer, &(-1_i128), &oid).is_err());
+    }
+
+    #[test]
+    fn test_pay_eurc_blocked_when_paused() {
+        let f = Fixture::new();
+        f.init();
+        f.client().set_eurc_contract(&f.eurc);
+
+        let amount: i128 = 1_000_000;
+        f.mint_eurc(&f.payer, amount);
+        f.client().pause(&f.admin);
+
+        let oid = order_bytes(&f.env, "eurc-paused");
+        assert!(f.client().try_pay_eurc(&f.payer, &amount, &oid).is_err());
     }
 
     // ── upgrade tests ─────────────────────────────────────────────────────────
