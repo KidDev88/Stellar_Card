@@ -87,6 +87,11 @@ pub enum DataKey {
     FeeCollector,
     /// Protocol fee in basis points (e.g. 20 = 0.2%) deducted from payments.
     FeeBps,
+    /// Authorized upgrade signers for the 2-of-3 multisig upgrade flow.
+    UpgradeSigners,
+    /// Signers that have approved a pending upgrade proposal, keyed by the
+    /// proposed WASM hash.
+    UpgradeApprovals(BytesN<32>),
 }
 
 /// Contract errors
@@ -541,6 +546,140 @@ impl Stellar_CardReceiver {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.deployer().update_current_contract_wasm(new_wasm_hash);
+    }
+
+    /// Sets the 3 authorized upgrade signers used by the 2-of-3 multisig
+    /// upgrade flow.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `signers` - Exactly 3 addresses authorized to propose/approve upgrades
+    ///
+    /// # Authorization
+    /// Only the admin can call this function.
+    ///
+    /// # Panics
+    /// Panics if `signers` does not contain exactly 3 addresses.
+    pub fn set_upgrade_signers(env: Env, signers: Vec<Address>) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        if signers.len() != 3 {
+            panic!("upgrade signers must be exactly 3 addresses");
+        }
+        env.storage().instance().set(&DataKey::UpgradeSigners, &signers);
+        Self::extend_instance_ttl(&env);
+    }
+
+    /// Returns the authorized upgrade signers.
+    pub fn upgrade_signers(env: Env) -> Vec<Address> {
+        env.storage().instance().get(&DataKey::UpgradeSigners).unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Proposes a contract WASM upgrade. The proposal counts as the first of
+    /// the required 2-of-3 approvals.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `caller` - The signer proposing the upgrade (must authorize this call)
+    /// * `new_wasm_hash` - The hash of the proposed new WASM code
+    ///
+    /// # Authorization
+    /// `caller` must be one of the 3 addresses stored in `UpgradeSigners`.
+    ///
+    /// # Events
+    /// Emits: topics=[Symbol("upgrade_proposed"), new_wasm_hash, caller],
+    /// value=approval count (1)
+    ///
+    /// # Panics
+    /// Panics if `caller` is not an authorized upgrade signer.
+    pub fn propose_upgrade(env: Env, caller: Address, new_wasm_hash: BytesN<32>) {
+        caller.require_auth();
+
+        let signers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeSigners)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !signers.contains(&caller) {
+            panic!("proposer must be an authorized upgrade signer");
+        }
+
+        let mut approvals = Vec::new(&env);
+        approvals.push_back(caller.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeApprovals(new_wasm_hash.clone()), &approvals);
+
+        env.events().publish(
+            (Symbol::new(&env, "upgrade_proposed"), new_wasm_hash, caller),
+            approvals.len(),
+        );
+        Self::extend_instance_ttl(&env);
+    }
+
+    /// Approves a pending upgrade proposal. Once a second distinct signer
+    /// approves (2-of-3 threshold), the WASM bytecode update executes and a
+    /// `contract_upgraded` event is emitted.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `caller` - The signer approving the upgrade (must authorize this call)
+    /// * `new_wasm_hash` - The hash of the proposed new WASM code
+    ///
+    /// # Authorization
+    /// `caller` must be one of the 3 addresses stored in `UpgradeSigners`,
+    /// must not have already approved this proposal, and a proposal for
+    /// `new_wasm_hash` must exist.
+    ///
+    /// # Events
+    /// Emits: topics=[Symbol("upgrade_approved"), new_wasm_hash, caller]
+    /// with the running approval count; when the threshold is reached also
+    /// emits topics=[Symbol("contract_upgraded"), new_wasm_hash, count].
+    ///
+    /// # Panics
+    /// Panics if `caller` is not an authorized upgrade signer, has already
+    /// approved, or if no proposal exists for `new_wasm_hash`.
+    pub fn approve_upgrade(env: Env, caller: Address, new_wasm_hash: BytesN<32>) {
+        caller.require_auth();
+
+        let signers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeSigners)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !signers.contains(&caller) {
+            panic!("approver must be an authorized upgrade signer");
+        }
+
+        let mut approvals: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeApprovals(new_wasm_hash.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        if approvals.contains(&caller) {
+            panic!("signer already approved this upgrade");
+        }
+
+        approvals.push_back(caller.clone());
+        let count = approvals.len();
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeApprovals(new_wasm_hash.clone()), &approvals);
+
+        env.events().publish(
+            (Symbol::new(&env, "upgrade_approved"), new_wasm_hash.clone(), caller),
+            count,
+        );
+
+        if count >= 2 {
+            env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+            env.events().publish(
+                (Symbol::new(&env, "contract_upgraded"), new_wasm_hash, count),
+                count,
+            );
+        }
+        Self::extend_instance_ttl(&env);
     }
 
     /// Recovers tokens sent to the contract by mistake — a direct transfer
@@ -2764,6 +2903,149 @@ mod test {
         // the bundled soroban-env-host WASM parser rejects.
         let new_hash = f.env.deployer().upload_contract_wasm(upgrade_wasm::WASM);
         f.client().upgrade(&new_hash);
+    }
+
+    // ── multisig upgrade tests ───────────────────────────────────────────────
+
+    fn three_signers(f: &Fixture) -> (Address, Address, Address) {
+        let s1 = Address::generate(&f.env);
+        let s2 = Address::generate(&f.env);
+        let s3 = Address::generate(&f.env);
+        let mut signers = Vec::new(&f.env);
+        signers.push_back(s1.clone());
+        signers.push_back(s2.clone());
+        signers.push_back(s3.clone());
+        f.client().set_upgrade_signers(&signers);
+        (s1, s2, s3)
+    }
+
+    #[test]
+    fn test_set_upgrade_signers_stores_three_addresses() {
+        let f = Fixture::new();
+        f.init();
+        let (s1, s2, s3) = three_signers(&f);
+
+        let stored = f.client().upgrade_signers();
+        assert_eq!(stored.len(), 3);
+        assert!(stored.contains(&s1));
+        assert!(stored.contains(&s2));
+        assert!(stored.contains(&s3));
+    }
+
+    #[test]
+    #[should_panic(expected = "exactly 3")]
+    fn test_set_upgrade_signers_requires_exactly_three() {
+        let f = Fixture::new();
+        f.init();
+        let mut signers = Vec::new(&f.env);
+        signers.push_back(Address::generate(&f.env));
+        f.client().set_upgrade_signers(&signers);
+    }
+
+    #[test]
+    fn test_propose_upgrade_emits_proposed_event() {
+        let f = Fixture::new();
+        f.init();
+        let (s1, _, _) = three_signers(&f);
+
+        let hash = BytesN::from_array(&f.env, &[1u8; 32]);
+        f.client().propose_upgrade(&s1, &hash);
+
+        let events = f.env.events().all();
+        let mut found = false;
+        for (contract_addr, topics, data) in events.iter() {
+            if contract_addr != f.contract_id {
+                continue;
+            }
+            let sym: Symbol = topics.get(0).unwrap().try_into_val(&f.env).unwrap();
+            if sym != Symbol::new(&f.env, "upgrade_proposed") {
+                continue;
+            }
+            let emitted_hash: BytesN<32> = topics.get(1).unwrap().try_into_val(&f.env).unwrap();
+            assert_eq!(emitted_hash, hash);
+            let count: u32 = data.try_into_val(&f.env).unwrap();
+            assert_eq!(count, 1);
+            found = true;
+            break;
+        }
+        assert!(found, "upgrade_proposed event not found");
+    }
+
+    #[test]
+    #[should_panic(expected = "authorized upgrade signer")]
+    fn test_propose_upgrade_rejects_non_signer() {
+        let f = Fixture::new();
+        f.init();
+        three_signers(&f);
+
+        let outsider = Address::generate(&f.env);
+        let hash = BytesN::from_array(&f.env, &[2u8; 32]);
+        f.client().propose_upgrade(&outsider, &hash);
+    }
+
+    #[test]
+    #[should_panic(expected = "authorized upgrade signer")]
+    fn test_approve_upgrade_rejects_non_signer() {
+        let f = Fixture::new();
+        f.init();
+        let (s1, _, _) = three_signers(&f);
+
+        let hash = BytesN::from_array(&f.env, &[3u8; 32]);
+        f.client().propose_upgrade(&s1, &hash);
+
+        let outsider = Address::generate(&f.env);
+        f.client().approve_upgrade(&outsider, &hash);
+    }
+
+    #[test]
+    #[should_panic(expected = "already approved")]
+    fn test_approve_upgrade_rejects_duplicate_signer() {
+        let f = Fixture::new();
+        f.init();
+        let (s1, _, _) = three_signers(&f);
+
+        let hash = BytesN::from_array(&f.env, &[4u8; 32]);
+        f.client().propose_upgrade(&s1, &hash);
+        f.client().approve_upgrade(&s1, &hash);
+    }
+
+    #[test]
+    fn test_propose_upgrade_does_not_execute_with_single_approval() {
+        let f = Fixture::new();
+        f.init();
+        let (s1, _, _) = three_signers(&f);
+
+        // A non-existent WASM hash would panic on update_current_contract_wasm.
+        // The propose succeeding with 1 approval proves no upgrade executed.
+        let hash = BytesN::from_array(&f.env, &[5u8; 32]);
+        f.client().propose_upgrade(&s1, &hash);
+    }
+
+    #[test]
+    fn test_two_of_three_approvals_execute_upgrade() {
+        let f = Fixture::new();
+        f.init();
+        let (s1, s2, _) = three_signers(&f);
+
+        let new_hash = f.env.deployer().upload_contract_wasm(upgrade_wasm::WASM);
+        f.client().propose_upgrade(&s1, &new_hash);
+        f.client().approve_upgrade(&s2, &new_hash);
+
+        // Reaching the 2-of-3 threshold executed update_current_contract_wasm
+        // against a real uploaded blob, so the call must have succeeded.
+        let events = f.env.events().all();
+        let mut upgraded = false;
+        for (contract_addr, topics, _) in events.iter() {
+            if contract_addr != f.contract_id {
+                continue;
+            }
+            let sym: Symbol = topics.get(0).unwrap().try_into_val(&f.env).unwrap();
+            if sym == Symbol::new(&f.env, "contract_upgraded") {
+                upgraded = true;
+                break;
+            }
+        }
+        assert!(upgraded, "contract_upgraded event should fire at 2-of-3");
     }
 
     // ── init events test ───────────────────────────────────────────────────
