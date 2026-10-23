@@ -3205,4 +3205,257 @@ mod test {
         assert!(INSTANCE_TTL_THRESHOLD < INSTANCE_TTL_MAX);
         assert_eq!(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_MAX / 2);
     }
+
+    // ── invariant fuzz tests ─────────────────────────────────────────────────
+    //
+    // Deterministic LCG-based fuzz harness. No external fuzzing dependency is
+    // required: the generator is fully reproducible from a seed, and every
+    // iteration asserts the payment-accounting invariants documented in
+    // docs/testing.md.
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Rng(seed)
+        }
+
+        fn next(&mut self) -> u64 {
+            // 64-bit LCG (Knuth MMIX constants) — good enough for input
+            // generation and fully reproducible across runs.
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0
+        }
+
+        fn next_range(&mut self, lo: u64, hi: u64) -> u64 {
+            lo + self.next() % (hi - lo + 1)
+        }
+    }
+
+    fn fuzz_order_id(env: &Env, n: u64) -> Bytes {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&n.to_le_bytes());
+        Bytes::from_slice(env, &buf)
+    }
+
+    /// Invariant 1: after any successful payment the contract's own token
+    /// balance is 0 — funds never rest on the contract.
+    /// Invariant 2: the treasury balance increases by exactly `amount`
+    /// (no-fee configuration) — no value is created or destroyed.
+    /// Invariant 3: rejected payments (non-positive amounts) leave every
+    /// balance unchanged.
+    #[test]
+    fn test_fuzz_payment_accounting_invariants() {
+        let f = Fixture::new();
+        f.init();
+        f.client().set_eurc_contract(&f.eurc);
+
+        let mut rng = Rng::new(0xC0FFEE);
+
+        for i in 0..1200u64 {
+            let amount = rng.next_range(1, 5_000_000) as i128;
+            let asset = rng.next_range(0, 2); // 0=usdc, 1=xlm, 2=eurc
+            let oid = fuzz_order_id(&f.env, i);
+
+            let treasury_before = match asset {
+                0 => f.usdc_balance(&f.treasury),
+                1 => f.xlm_balance(&f.treasury),
+                _ => f.eurc_balance(&f.treasury),
+            };
+            let contract_balance_before = match asset {
+                0 => f.usdc_balance(&f.contract_id),
+                1 => f.xlm_balance(&f.contract_id),
+                _ => f.eurc_balance(&f.contract_id),
+            };
+
+            match asset {
+                0 => {
+                    f.mint_usdc(&f.payer, amount);
+                    f.client().pay_usdc(&f.payer, &amount, &oid);
+                }
+                1 => {
+                    f.mint_xlm(&f.payer, amount);
+                    f.client().pay_xlm(&f.payer, &amount, &oid);
+                }
+                _ => {
+                    f.mint_eurc(&f.payer, amount);
+                    f.client().pay_eurc(&f.payer, &amount, &oid);
+                }
+            }
+
+            let treasury_after = match asset {
+                0 => f.usdc_balance(&f.treasury),
+                1 => f.xlm_balance(&f.treasury),
+                _ => f.eurc_balance(&f.treasury),
+            };
+            let contract_balance_after = match asset {
+                0 => f.usdc_balance(&f.contract_id),
+                1 => f.xlm_balance(&f.contract_id),
+                _ => f.eurc_balance(&f.contract_id),
+            };
+
+            assert_eq!(
+                contract_balance_after, 0,
+                "iteration {}: contract must hold 0 after payment",
+                i
+            );
+            assert_eq!(
+                contract_balance_after, contract_balance_before,
+                "iteration {}: contract balance must not change across a payment",
+                i
+            );
+            assert_eq!(
+                treasury_after - treasury_before,
+                amount,
+                "iteration {}: treasury must increase by exactly the payment amount",
+                i
+            );
+        }
+    }
+
+    /// Non-positive amounts must be rejected for every asset type and must
+    /// not move any balance (no state desynchronization on the error path).
+    #[test]
+    fn test_fuzz_invalid_amounts_never_move_value() {
+        let f = Fixture::new();
+        f.init();
+        f.client().set_eurc_contract(&f.eurc);
+
+        let mut rng = Rng::new(0xDEAD_BEEF);
+
+        for i in 0..600u64 {
+            let amount: i128 = if rng.next() % 2 == 0 {
+                0
+            } else {
+                -(rng.next_range(1, 1_000_000) as i128)
+            };
+            let asset = rng.next_range(0, 2);
+            let oid = fuzz_order_id(&f.env, i);
+
+            let usdc_before = f.usdc_balance(&f.treasury);
+            let xlm_before = f.xlm_balance(&f.treasury);
+            let eurc_before = f.eurc_balance(&f.treasury);
+
+            let result = match asset {
+                0 => f.client().try_pay_usdc(&f.payer, &amount, &oid),
+                1 => f.client().try_pay_xlm(&f.payer, &amount, &oid),
+                _ => f.client().try_pay_eurc(&f.payer, &amount, &oid),
+            };
+            assert!(result.is_err(), "iteration {}: non-positive amount must fail", i);
+
+            assert_eq!(f.usdc_balance(&f.treasury), usdc_before);
+            assert_eq!(f.xlm_balance(&f.treasury), xlm_before);
+            assert_eq!(f.eurc_balance(&f.treasury), eurc_before);
+        }
+    }
+
+    /// Paused state must reject every payment regardless of asset or amount,
+    /// leaving balances untouched — the pause circuit breaker cannot be
+    /// bypassed by input variation.
+    #[test]
+    fn test_fuzz_paused_contract_rejects_all_payments() {
+        let f = Fixture::new();
+        f.init();
+        f.client().set_eurc_contract(&f.eurc);
+
+        let mut rng = Rng::new(0x1234_5678);
+
+        for i in 0..600u64 {
+            let amount = rng.next_range(1, 1_000_000) as i128;
+            let asset = rng.next_range(0, 2);
+            let oid = fuzz_order_id(&f.env, i);
+
+            f.client().pause(&f.admin);
+
+            let usdc_before = f.usdc_balance(&f.treasury);
+            let xlm_before = f.xlm_balance(&f.treasury);
+            let eurc_before = f.eurc_balance(&f.treasury);
+
+            let result = match asset {
+                0 => {
+                    f.mint_usdc(&f.payer, amount);
+                    f.client().try_pay_usdc(&f.payer, &amount, &oid)
+                }
+                1 => {
+                    f.mint_xlm(&f.payer, amount);
+                    f.client().try_pay_xlm(&f.payer, &amount, &oid)
+                }
+                _ => {
+                    f.mint_eurc(&f.payer, amount);
+                    f.client().try_pay_eurc(&f.payer, &amount, &oid)
+                }
+            };
+            assert!(result.is_err(), "iteration {}: paused payment must fail", i);
+            assert_eq!(f.usdc_balance(&f.treasury), usdc_before);
+            assert_eq!(f.xlm_balance(&f.treasury), xlm_before);
+            assert_eq!(f.eurc_balance(&f.treasury), eurc_before);
+
+            f.client().unpause(&f.admin);
+        }
+    }
+
+    /// With a fee configured the accounting splits, but the conservation
+    /// invariant still holds: treasury_delta + fee_delta == amount and the
+    /// contract itself never retains a balance.
+    #[test]
+    fn test_fuzz_fee_split_conserves_total_value() {
+        let f = Fixture::new();
+        f.init();
+
+        let collector = Address::generate(&f.env);
+        f.client().set_fee_collector(&collector);
+        f.client().set_fee_bps(&20u32);
+
+        let mut rng = Rng::new(0xFEE0_FEE0);
+
+        for i in 0..600u64 {
+            let amount = rng.next_range(1, 5_000_000) as i128;
+            let asset = rng.next_range(0, 1); // usdc or xlm
+            let oid = fuzz_order_id(&f.env, i);
+
+            let treasury_before = match asset {
+                0 => f.usdc_balance(&f.treasury),
+                _ => f.xlm_balance(&f.treasury),
+            };
+            let fee_before = match asset {
+                0 => f.usdc_balance(&collector),
+                _ => f.xlm_balance(&collector),
+            };
+
+            match asset {
+                0 => {
+                    f.mint_usdc(&f.payer, amount);
+                    f.client().pay_usdc(&f.payer, &amount, &oid);
+                }
+                _ => {
+                    f.mint_xlm(&f.payer, amount);
+                    f.client().pay_xlm(&f.payer, &amount, &oid);
+                }
+            }
+
+            let treasury_delta = match asset {
+                0 => f.usdc_balance(&f.treasury) - treasury_before,
+                _ => f.xlm_balance(&f.treasury) - treasury_before,
+            };
+            let fee_delta = match asset {
+                0 => f.usdc_balance(&collector) - fee_before,
+                _ => f.xlm_balance(&collector) - fee_before,
+            };
+            let contract_balance = match asset {
+                0 => f.usdc_balance(&f.contract_id),
+                _ => f.xlm_balance(&f.contract_id),
+            };
+
+            assert_eq!(
+                treasury_delta + fee_delta,
+                amount,
+                "iteration {}: treasury + fee must equal the payment amount",
+                i
+            );
+            assert_eq!(contract_balance, 0, "iteration {}: contract must hold 0", i);
+        }
+    }
 }
