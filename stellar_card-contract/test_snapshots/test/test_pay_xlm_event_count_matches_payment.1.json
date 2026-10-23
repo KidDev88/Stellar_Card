@@ -472,7 +472,10 @@
             "key": {
               "vec": [
                 {
-                  "symbol": "ReentrancyGuard"
+                  "symbol": "PaymentRateLimit"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 }
               ]
             },
@@ -489,19 +492,29 @@
                 "key": {
                   "vec": [
                     {
-                      "symbol": "ReentrancyGuard"
+                      "symbol": "PaymentRateLimit"
+                    },
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                     }
                   ]
                 },
                 "durability": "temporary",
                 "val": {
-                  "bool": false
+                  "vec": [
+                    {
+                      "u32": 0
+                    },
+                    {
+                      "u32": 0
+                    }
+                  ]
                 }
               }
             },
             "ext": "v0"
           },
-          15
+          200
         ]
       ],
       [
@@ -586,18 +599,6 @@
                         },
                         "val": {
                           "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
-                              "symbol": "Paused"
-                            }
-                          ]
-                        },
-                        "val": {
-                          "bool": false
                         }
                       },
                       {
